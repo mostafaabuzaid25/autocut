@@ -1,0 +1,540 @@
+#!/bin/bash
+set -e
+##help
+function usage {
+   echo -e "usage: $(basename "$0") beta -g <file>  -s <file>  -p <intger>  -o <string>  -A <dir> -e <string>"
+   echo ""
+   echo "Required"
+   echo -e "\t-g\tgenome.fasta:\tFASTA formatted reference genome"
+   echo -e "\t-s\tsample_file.tsv"
+   echo -e "\t-p\tnum of threads"
+   echo -e "\t-o\tReference genome version options: hg38, hg19 , mm10 or mm9"
+   echo	-e "\t-A\tillumina adaptor sequance path folder (Note if there is custome adaptor then -A adaptor.fa)"
+   echo -e "\t-b\tblacklist.bed repeatitve motif match"
+   echo -e "optional:"
+   echo -e "\t-d\tWhether the reads (BAM file) with duplication or not will be used in the peak calling step options: TRUE or FALSE (default:FALSE)"
+   echo -e "\t-f\tWhether filter the bam files based on the cretiria of fragment size 120 options: TRUE or FALSE (default:FALSE)"
+   echo -e "\t-k\tspikein genome.fasta the spike-in genome information to Whether normalize the signal file (bigwig) based on spike-in reads(default:FALSE)"
+   echo -e "\t-e\toptions:(CRUN or CTag) CRUN (cut&run) or CTag (cut&Tag) (default:CRUN)"
+   echo -e "\t-a\toptions:(Truseq,Nextera) Type of illumina adaptor (default:Truseq)"			
+}
+
+# Define list of arguments expected in the input
+optstring=":g:s:p:o:b:e:k:f:a:A:d:"
+
+while getopts ${optstring} option; do
+  case "$option" in
+    'g') ref=$OPTARG ;;
+    's') samplelist=$OPTARG ;;
+    'p') CPU=$OPTARG ;;
+	'b') blacklist=$OPTARG ;;
+	'o') organism_build=$OPTARG ;;
+	'k') spkn=$OPTARG ;;
+	'e') experiment_type=$OPTARG ;;
+	'f') frag=$OPTARG ;;
+	'a') adaptor_type=$OPTARG ;;
+	'A') adapterpath=$OPTARG ;;
+	'd') dup_peak_calling=$OPTARG;;
+	'h') usage; exit;;
+   '\?') echo "Unknown option: -$OPTARG" ; exit 1;;
+    ':') echo "Missing option argument for -$OPTARG" ; exit 1;;
+    '*') echo "Unimplemented option: -$OPTARG" ; exit 1;;
+  esac
+done
+
+
+if [ -z "$ref" ]; then
+   echo "error genome.fasta is required"
+			usage
+   exit 0 
+   fi
+   
+if [ -z "$samplelist" ]; then
+   echo "error sample file.tsv is required"
+			usage
+   exit 0   
+fi
+
+if [ -z "$organism_build" ]; then
+   echo "error organism build is required"
+			usage
+    exit 0
+fi
+
+if [ -z "$adapterpath" ]; then
+   echo "error adaptor_type is required"
+			usage
+   exit 0
+fi
+
+if [  -z "$CPU" ]; then
+   echo "error CPU build is required"
+			usage
+   exit 0
+fi
+
+if [  -z "$blacklist" ]; then
+   echo "error blacklist build is required"
+			usage
+   exit 0
+fi
+
+
+
+
+# Debug output
+echo "[info] start pipline"
+echo "[info] Ref genome file: $ref"
+echo "[info] Sample list file: $samplelist"
+echo "[info] Number of threads: $CPU"
+echo "[info] Organism build: $organism_build"
+echo "[info] Experiment type: $experiment_type"
+
+mkdir -p 01_index \
+		 02_data \
+		 03_cleandata \
+		 04_mapping \
+		 05_peakcalling \
+		 06_meme \
+		 07_metrics \
+		 checkpoint
+#=======================================================================================
+# internal_variable
+name=01_index/Genome
+spkname=01_index/spknGenome
+
+if [ "$organism_build" != "hg38" ] && [ "$organism_build" != "hg19" ] && [ "$organism_build" != "mm10" ] && [ "$organism_build" != "mm9" ]
+    then
+    echo "organism_build should be one of hg38, hg19, mm10 or mm9"
+    exit 1
+fi
+
+if [ "$organism_build" == "hg38" ] || [ "$organism_build" == "hg19" ]
+then
+    macs2_genome=hs
+else 
+    macs2_genome=mm
+fi
+
+if [ "$organism_build" == "hg38" ]
+then
+    eGenomeSize=2913022398
+elif [ "$organism_build" == "hg19" ]
+then
+    eGenomeSize=2864785220
+elif [ "$organism_build" == "mm10" ]
+then
+    eGenomeSize=2652783500
+else
+    eGenomeSize=2620345972
+fi
+
+## Index_Ref_genome
+if [[ ! -f checkpoint/bwk.ok ]]
+  then
+ echo "[info] Indexing Genome ..."
+	bioawk -c fastx '{print}'  $ref | \
+	sort -k1,1V | \
+	awk '{print ">"$1;print $2}' | \
+	fold > ${name}.fasta
+bioawk -c fastx '{print $name"\t"length($seq)}' ${name}.fasta > ${name}.length
+fi && touch checkpoint/bwk.ok
+
+if [[ ! -f checkpoint/picard.ok ]]
+  then
+	picard  CreateSequenceDictionary \
+			REFERENCE=${name}.fasta \
+			OUTPUT=${name}.dict > Run.log 2>&1 
+			
+fi && touch checkpoint/picard.ok
+
+if [[ ! -f checkpoint/samtools.ok ]]
+  then
+	samtools faidx \
+			 ${name}.fasta
+
+fi && touch checkpoint/samtools.ok
+
+if [[ ! -f checkpoint/bowtie2-build.ok ]]
+  then
+	bowtie2-build \
+			${name}.fasta \
+			${name}  
+
+fi && touch checkpoint/bowtie2-build.ok
+
+if [[ ! -f checkpoint/bowtie2-build_spkn.ok ]]
+  then
+if [ -z ${spkn} ]
+then
+echo "[info:indexing] No spike-in genome found ..."
+
+else
+	bowtie2-build 
+			${spkname}.fasta \
+			${spkname}  >> Run.log 2>&1
+fi
+
+fi && touch checkpoint/bowtie2-build_spkn.ok
+
+if [[ ! -f checkpoint/length.ok ]]
+  then
+bioawk -c fastx \
+		  '{print $name"\t"length($seq)}' \
+		  ${name}.fasta > ${name}.length
+fi & touch checkpoint/length.ok
+
+## data_importing
+while read a b c d e f ; do
+if [[ ! -f checkpoint/${c}_importing.ok ]]
+then 
+echo "[info] Importing data ..."
+ echo "ln -s ${a} 02_data/${c}_1.fq.gz && touch checkpoint/${c}_1_importing.ok"|sh;
+ echo "ln -s ${b} 02_data/${c}_2.fq.gz && touch checkpoint/${c}_2_importing.ok"|sh;
+fi && touch checkpoint/${c}_importing.ok
+done < $samplelist 
+
+## trimming paired-end
+while read a b c d e f ; do
+if [[ ! -f checkpoint/${c}_trimming.ok ]]
+ then
+ echo "[info] Trimming file ${c} ..."
+
+if [ "$adaptor_type" == "Truseq" ]
+then
+echo "[info] Use Truseq adaptor  "
+
+trimmomatic PE -threads $CPU \
+			   -phred33 \
+			   02_data/${c}_1.fq.gz 02_data/${c}_2.fq.gz \
+			   03_cleandata/${c}_1.fq.gz 03_cleandata/${c}_U_1.fq.gz \
+			   03_cleandata/${c}_2.fq.gz 03_cleandata/${c}_U_2.fq.gz \
+			   ILLUMINACLIP:$adapterpath/Truseq3.PE.fa:2:15:4:4:true \
+			   LEADING:20 TRAILING:20 SLIDINGWINDOW:4:15 MINLEN:25 HEADCROP:6  >> Run.log 2>&1
+
+
+elif [ "$adaptor_type" == "Nextera" ]
+then
+echo "[info] Use Nextera adaptor  "
+trimmomatic PE -threads $CPU \
+			   -phred33 \
+			   02_data/${c}_1.fq.gz 02_data/${c}_2.fq.gz \
+			   03_cleandata/${c}_1.fq.gz 03_cleandata/${c}_U_1.fq.gz \
+			   03_cleandata/${c}_2.fq.gz 03_cleandata/${c}_U_2.fq.gz \
+			   ILLUMINACLIP:$adapterpath/NexteraPE-PE.fa:2:15:4:4:true \
+			   LEADING:20 TRAILING:20 SLIDINGWINDOW:4:15 MINLEN:25 HEADCROP:6 >> Run.log 2>&1
+
+  
+
+else
+echo "[info] Use Truseq adaptor as default  "
+  trimmomatic PE -threads $CPU \
+			   -phred33 \
+			   02_data/${c}_1.fq.gz 02_data/${c}_2.fq.gz \
+			   03_cleandata/${c}_1.fq.gz 03_cleandata/${c}_U_1.fq.gz \
+			   03_cleandata/${c}_2.fq.gz 03_cleandata/${c}_U_2.fq.gz \
+			   ILLUMINACLIP:$adapterpath/TruSeqAdapters.fa:2:15:4:4:true \
+			   LEADING:20 TRAILING:20 SLIDINGWINDOW:4:15 MINLEN:25 HEADCROP:6  >> Run.log 2>&1
+fi 
+ 
+fi && touch checkpoint/${c}_trimming.ok
+done < $samplelist 
+
+
+## mapping
+while read a b c d e f ; do
+
+if [[ ! -f checkpoint/${c}_mapping.ok ]]
+  then
+ echo "[info] Aligning file ${c} to reference genome..."
+
+if [ -z ${frag} ]
+then
+	echo "[info] Bowtie2 command: --very-sensitive-local --phred33 -I 10 -X 700"
+    echo "[info] The dovetail mode is off [as parameter frag is off]"
+    (bowtie2 -p $CPU \
+			--end-to-end \
+			--no-mixed \
+			--no-discordant \
+			--very-sensitive-local \
+			--phred33 -I 10 -X 700 \
+			-x $name \
+			-1 03_cleandata/${c}_1.fq.gz \
+			-2 03_cleandata/${c}_2.fq.gz) \
+			 2> 07_metrics/mapping_stats_${c}.txt|samtools view -bS - > 04_mapping/${c}_R.bam
+else			 
+    echo "[info] Bowtie2 command: --dovetail --phred33"
+    echo "[info] The dovetail mode is enabled [as parameter frag is on]"
+    (bowtie2 -p $CPU \
+			--end-to-end \
+			--no-mixed \
+			--no-discordant \
+			--dovetail \
+			--phred33 -x $name \
+			-1 03_cleandata/${c}_1.fq.gz \
+			-2 03_cleandata/${c}_2.fq.gz) \
+			2> 07_metrics/mapping_stats_${c}.txt|samtools view -bS - > 04_mapping/${c}_R.bam
+
+fi
+fi && touch checkpoint/${c}_mapping.ok
+done < $samplelist
+
+
+
+
+while read a b c d e f  ; do
+
+if [[ ! -f checkpoint/${c}_Filtering_sort.ok ]]
+
+then
+ echo "[info] sorting fragments ${c} ..."
+
+sambamba sort 	-t $CPU \
+				-o 04_mapping/${c}_S.bam \
+				   04_mapping/${c}_R.bam 
+
+
+fi && touch checkpoint/${c}_Filtering_sort.ok
+
+done < $samplelist
+
+
+while read a b c d e f ; do
+if [[ ! -f checkpoint/${c}_Duplicates.ok ]]
+then
+ echo "[info] Filtering multimatching and duplicates ${c} ..."
+sambamba view 	-t $CPU \
+				-h \
+				-f bam \
+				-F "[XS] == null and not unmapped  and not duplicate" \
+				-o 04_mapping/${c}_f.bam \
+				   04_mapping/${c}_S.bam 
+fi && touch  checkpoint/${c}_Duplicates.ok 
+
+done < $samplelist
+
+
+##spikein_mapping
+
+while read a b c d e f ; do
+if [[ ! -f checkpoint/${c}_spikein_mapping.ok ]]
+  then
+if [ -z ${spkn} ]
+then
+echo "[info] ${c} won't be aligned to the spike-in genome"
+else
+echo "[info] Aligning file ${c} to spike-in genome"
+    
+    (bowtie2 -p $CPU \
+			--end-to-end \
+			--no-mixed \
+			--no-discordant \
+			--dovetail \
+			--phred33 \
+			-x $spkname/genome \
+			-1 03_cleandata/${c}_1.fq.gz \
+			-2 03_cleandata/${c}_2.fq.gz) \
+			2> 07_metrics/spikein_mapping_stats_${c}.txt |\
+			sambamba  view -S -f bam  -t 24 /dev/stdin -o 04_mapping/${c}.bam
+			 
+
+			${c}_total_reads=`cat 07_metrics/spikein_mapping_stats_${c} | grep "reads; of these:" | awk '{print $1}' - FS=' '`
+			${c}_align_ratio=`cat 07_metrics/spikein_mapping_stats_${c} | grep "overall alignment" | awk '{print $1}' - FS=' ' | cut -f1 -d"%"`
+			${c}_spikein_reads=`printf "%.0f" $(echo "${c}_$total_reads * ${c}_$align_ratio/100"|bc)`
+
+     echo "[info] Spikein reads number is $spikein_reads, consisting of $align_ratio % of total reads"
+     echo "[info] This information could be used in spike-in normalization when generating bigwig files"
+
+	fi  
+fi && touch checkpoint/${c}_spikein_mapping.ok
+done < $samplelist
+
+
+
+
+## reminder dup_peak_calling flag
+
+## shifting reads if the experiment is no dup CUT&Tag
+while read a b c d e f ; do
+
+if [[ ! -f checkpoint/${c}_shifting.ok ]]
+then
+
+if [ "$experiment_type" == "CTag" ]
+then
+     echo "[info] Reads shifting "
+     echo "[info] All reads aligning to the + strand were offset by +4 bp, and all reads aligning to the – strand were offset −5 bp, since the CUT&Tag approach uses Tn5 transposase which has been shown to bind as a dimer and insert two adaptors separated by 9 bp... "
+     echo "[info] The shifted BAM files will be used in the following analysis "
+     echo "[info] Shifting and indexing "
+    # use --ATACshift
+alignmentSieve \
+		--numberOfProcessors $CPU \
+		--ATACshift \
+		--bam 04_mapping/${c}.bam \
+		-o 5_mapping/${c}.tmp.bam >> Run.log 2>&1
+    
+	# the bam file needs to be sorted again
+samtools sort -@ $CPU \
+			  -O bam \
+			  -o 5_mapping/${c}.bam \
+				5_mapping/${c}.tmp.bam
+samtools index -@ $CPU \
+				5_mapping/${c}.bam
+				
+else
+     echo "[info] Reads shifting "
+     echo "[info] Your data won't be shifted as the experiment_type is specified as CUT&RUN... "
+fi
+fi && touch checkpoint/${c}_shifting.ok
+done < $samplelist
+
+
+
+## spike-in norm
+
+while read a b c d e f ; do
+if [[ ! -f checkpoint/${c}_spikein_Peak_Norm.ok ]]
+then
+if [ -z ${spkn} ]
+then 
+echo "[info] Your bigwig file won't be normalized with spike-in reads as no spike-in genome selected ..."
+elif [ "$spikein_reads" == "0" ] 
+then
+echo "[info] Your bigwig file won't be normalized with spike-in reads as the spike-in reads were 0 ..."
+else
+
+scale=$spikein_scale
+scale_factor=`printf "%.0f" $(echo "$scale / $spikein_reads"|bc)`
+echo scale_factor=$scale_factor
+bamCoverage --bam 04_mapping/${c}.bam -o 05_peakcalling/${c}.bw \
+        --binSize 10 \
+        --normalizeUsing CPM \
+        --effectiveGenomeSize $eGenomeSize \
+        --scaleFactor $scale_factor >> Run.log 2>&1
+
+fi
+fi && touch checkpoint/${c}_spikein_Peak_Norm.ok
+
+done < $samplelist
+
+
+### peak calls
+while read a b c d e f ; do
+if [[ ! -f checkpoint/${d}_histone_calling.ok ]]
+	then
+if [ "${f}" == "RH" ]
+then
+
+echo "[info] peak calling of histone ..."
+
+macs3 callpeak \
+	-t 04_mapping/${d}*_f.bam \
+	-c 04_mapping/${e}*_f.bam \
+	-g $macs2_genome -f BAMPE -n ${d} \
+	--outdir 05_peakcalling/ \
+	-q 0.01 -B --SPMR \
+	--broad \
+	--keep-dup all >> Run.log 2>&1
+ 
+cat 05_peakcalling/${d}_peaks.broadPeak | grep -v -e "chrM" | sort-bed - | bedops -n 1 - $blacklist > 04_mapping/${d}
+
+fi
+
+fi && touch checkpoint/${d}_histone_calling.ok
+
+done < $samplelist
+
+
+
+
+
+while read a b c d e f ; do
+
+if [[ ! -f checkpoint/${d}_Peak_calling.ok ]]
+	then
+if  [ "${f}" == "s" ]
+then
+echo "[info] peak calling of ${d} ..."
+
+macs3 callpeak \
+	-t 04_mapping/${d}*_f.bam \
+	-c 04_mapping/${e}*_f.bam \
+	--SPMR \
+	-g $macs2_genome -f BAMPE -n ${d} \
+	--outdir 05_peakcalling/ \
+	-q 0.01 -B  \
+	--call-summits \
+	--SPMR\
+	--keep-dup all >> Run.log 2>&1
+
+
+cat 05_peakcalling/${d}_peaks.narrowPeak | grep -v -e "chrM" | sort-bed - | bedops -n 1 - $blacklist > 05_peakcalling/${d}_BL_peaks.bed
+cat 05_peakcalling/${d}_summits.bed| grep -v -e "chrM" |sort-bed - | bedops -n 1 - $blacklist > 05_peakcalling/${d}_BL_summits.bed
+
+fi
+
+fi && touch checkpoint/${d}_Peak_calling.ok
+
+done < $samplelist
+
+
+
+while read a b c d e f ; do
+
+if [[ ! -f checkpoint/${d}_coverage.ok ]]
+	then
+if  [ "${f}" == "s" ]
+then
+
+echo "[info] getting bamCoverage ${d} ..."
+bedGraphToBigWig 05_peakcalling/${d}_treat_pileup.bdg $name.length 05_peakcalling/${d}.bw 
+
+elif [ "${f}" == "RH" ]
+then
+echo "[info] getting bamCoverage ${d} ..."
+bedGraphToBigWig 05_peakcalling/${d}_treat_pileup.bdg $name.length 05_peakcalling/${d}.bw
+
+fi
+
+fi && touch checkpoint/${d}_coverage.ok
+
+done < $samplelist
+
+
+
+
+
+
+# #meme-chip
+
+# while read a b c d ; do
+
+# if [[ ! -f checkpoint/${c}_Meme.ok ]]
+	# then
+
+# if  [ "${c}" == "$control" ]
+# then
+# echo "[info] ${c} is the control sample skip ..."
+# elif [ "${c}" != "$control" ]
+# then
+
+# >&2 echo "[info] Getting Fasta sequences ${c} ..."
+
+# ## meme-chip start
+# bedops -e 1 05_peakcalling/${c}_BL_summits.bed 05_peakcalling/${c}_BL_peaks.bed > 06_meme/${c}.bed
+# bedops --range 150 -u 06_meme/${c}.bed > 06_meme/${c}_range_150.bed
+# bedtools getfasta -fi $name.fasta -bed 06_meme/${c}_range_150.bed -fo 06_meme/${c}_range_150.fasta 
+# >&2 echo "[info] Start MEME analysis for de novo motif finding ..."
+# meme-chip -oc 06_meme/${c}  06_meme/${c}_range_150.fasta >> Run.log 2>&1
+# dreme -oc 06_meme/${c} 06_meme/${c} >> Run.log 2>&1
+# gff2bed < 06_meme/${c}/fimo_out_1/fimo.gff | awk 'BEGIN {IFS="\t"; OFS="\t";} {print $1,$2,$3,$4,$5,$6}' > 06_meme/${c}/fimo_out_1/fimo.bed
+
+# fi
+
+# fi && touch checkpoint/${c}_spikein_Peak_Norm.ok
+# done < $samplelist
+
+echo "# "
+echo "#        				analysis is complete!"
+echo "# "
+echo "--------------------------------------------------------------------------"
